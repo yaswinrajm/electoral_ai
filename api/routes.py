@@ -1,414 +1,294 @@
 """
-api/routes.py — Core API Route Handlers
-=========================================
-Defines all REST API endpoints for the Electoral AI backend. This module handles:
-  - Language dictionary serving (UI translation, pre-cached in static JSON)
-  - Real-time text translation via Google Cloud Translation API
-  - Text-to-Speech audio synthesis via Google Cloud TTS API
-  - AI question answering via Google Vertex AI (Gemini 2.5 Flash)
+api/routes.py — API Route Handlers (Thin Controller Layer)
+===========================================================
+Defines all REST API endpoints exposed by the Electoral AI backend.
+This module acts as a thin controller — it handles HTTP concerns only
+(request parsing, response formatting, error wrapping) and delegates
+all business logic to the services/ layer.
 
-Key Design Decisions:
-  - All Google SDK clients (Translation, TTS) are initialized ONCE at module load
-    to minimize per-request latency ("warm initialization").
-  - Gemini GenerativeModel instances are cached per language to avoid re-initialization
-    overhead on every request.
-  - UI translations are pre-generated via `generate_translations.py` and loaded from
-    `static/translations.json` at startup — making language switching instant and
-    completely free (no Translation API calls at runtime).
-  - The AI system prompt locks Gemini to Indian electoral context and enforces
-    strict political neutrality with BLOCK_MEDIUM_AND_ABOVE safety thresholds.
-  - Retry logic (max 3 attempts, 5s delay) handles transient 429 quota errors.
+Endpoint Summary:
+    GET  /api/health          — Liveness probe for Cloud Run health checks
+    GET  /api/dictionary      — Serve pre-cached UI translation dictionary
+    POST /api/translate       — Translate a text string to a target language
+    POST /api/tts             — Convert text to Base64-encoded MP3 audio
+    POST /api/ask             — Submit a voter question to Gemini AI
+
+Architecture:
+    routes.py (HTTP layer)
+        → services/ai_service.py          (Gemini inference + retry)
+        → services/translation_service.py (Google Translation API)
+        → services/tts_service.py         (Google TTS API)
+        → data/electoral_data.py          (static constants)
+        → config.py                       (environment settings)
 
 Author: Yaswin Raj M
 Project: Google Prompt War Hackathon — Multilingual Electoral AI
 """
 
 import os
-import json
-import time
-import base64
-
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from config import settings
+from typing import Dict, Optional
 
 import vertexai
-from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
+from fastapi import APIRouter, HTTPException
 from google.cloud import translate_v2 as translate
 from google.cloud import texttospeech
+from pydantic import BaseModel
+
+from config import settings
+from data.electoral_data import BASE_DICTIONARY
+from services.ai_service import ask_ai_with_retry, GEMINI_MODEL_CACHE  # cache exposed for test injection
+from services.translation_service import load_dictionary_cache, translate_text_to_language
+from services.tts_service import synthesize_speech
 
 
-# ─── Router ───────────────────────────────────────────────────────────────────
+# ─── Router Instance ──────────────────────────────────────────────────────────
 router = APIRouter()
 
 
 # ─── Global Client Singletons ─────────────────────────────────────────────────
-# These are initialized once at startup and reused for every request.
-# Avoids the overhead of creating new API client connections per request.
-TRANSLATE_CLIENT = None
-TTS_CLIENT = None
-GEMINI_MODEL_CACHE: dict = {}  # Keyed by language code, e.g. {"hi": GenerativeModel(...)}
+# Initialized once at startup; reused for every request to avoid per-call latency.
+TRANSLATE_CLIENT: Optional[translate.Client] = None
+TTS_CLIENT: Optional[texttospeech.TextToSpeechClient] = None
 
 
-def init_clients():
+
+def init_clients() -> None:
     """
-    Initializes Google Cloud SDK clients and Vertex AI at application startup.
+    Initializes all Google Cloud SDK clients at application startup.
 
-    This function is called once when the module is first imported. By doing
-    this at module level rather than inside request handlers, we avoid the
-    latency cost of client initialization on every API call.
+    Called once when this module is first imported. Initializing clients here
+    avoids the overhead of creating new connections on every HTTP request.
 
-    MOCK_MODE is read directly from os.environ at call time (not from the
-    pre-loaded settings object) so that pytest-env can override it before
-    the module is imported during test collection.
+    Implementation Note:
+        MOCK_MODE is read directly from ``os.environ`` (not from the Settings
+        object) so that ``pytest-env`` can override the variable before this
+        module is imported during test collection. If MOCK_MODE is truthy,
+        this function is a no-op and no credentials are required.
 
-    In mock_mode, this function is a no-op — no real API credentials are needed.
+    Returns:
+        None
     """
     global TRANSLATE_CLIENT, TTS_CLIENT
 
-    # Read directly from os.environ so pytest-env override takes effect
-    mock_mode = os.environ.get("MOCK_MODE", "false").lower() in ("true", "1", "yes")
+    mock_mode: bool = os.environ.get("MOCK_MODE", "false").lower() in ("true", "1", "yes")
     if mock_mode:
-        return  # Skip all Google API initialization in mock/test mode
+        return  # Skip all API initialization in test/mock mode
 
-    # Initialize Translation client (singleton)
+    # Ensure the service account key path is set as an env var for Google SDK auth.
+    # This is needed when running locally where the .env value is loaded by Pydantic
+    # but not automatically exported to the OS environment.
+    if settings.google_application_credentials and not os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = settings.google_application_credentials
+
     if TRANSLATE_CLIENT is None:
         TRANSLATE_CLIENT = translate.Client()
 
-    # Initialize Text-to-Speech client (singleton)
     if TTS_CLIENT is None:
         TTS_CLIENT = texttospeech.TextToSpeechClient()
 
-    # Initialize Vertex AI SDK with our GCP project and region
-    vertexai.init(project="daring-span-495114-b2", location="us-central1")
+    vertexai.init(
+        project=settings.gcp_project_id,
+        location=settings.gcp_region,
+    )
 
 
 # Run at module import time
 init_clients()
 
 
-# ─── Request/Response Models ──────────────────────────────────────────────────
+# ─── In-Memory Translation Cache ──────────────────────────────────────────────
+# Loaded from static/translations.json at startup; all 10 languages in memory.
+DICTIONARY_CACHE: Dict[str, Dict[str, str]] = load_dictionary_cache()
+
+
+# ─── Request / Response Models ────────────────────────────────────────────────
 
 class TranslateRequest(BaseModel):
-    """Request body for the /translate endpoint."""
-    text: str             # The text to translate
-    target_language: str  # BCP-47 language code (e.g., "hi", "ta", "en")
+    """
+    Request body schema for POST /api/translate.
+
+    Attributes:
+        text (str): The source text to translate.
+        target_language (str): ISO 639-1 language code for the target language
+                               (e.g., "hi" for Hindi, "ta" for Tamil).
+    """
+
+    text: str
+    target_language: str
 
 
 class TTSRequest(BaseModel):
-    """Request body for the /tts endpoint."""
-    text: str      # The text to convert to speech
-    language: str  # Language code for voice selection (e.g., "hi", "ta")
+    """
+    Request body schema for POST /api/tts.
+
+    Attributes:
+        text (str): The text string to synthesize into speech.
+        language (str): ISO 639-1 language code used for voice selection
+                        (e.g., "hi" → hi-IN voice, "ta" → ta-IN voice).
+    """
+
+    text: str
+    language: str
 
 
 class AskRequest(BaseModel):
-    """Request body for the /ask endpoint."""
-    question: str                   # The user's question in any language
-    target_language: str = "en"     # Language code for the AI response (default: English)
-
-
-# ─── UI Translation Dictionary ────────────────────────────────────────────────
-# This is the master English source for all UI labels, buttons, and text.
-# The `generate_translations.py` script translates this into all supported
-# languages and saves the output to `static/translations.json`.
-BASE_DICTIONARY = {
-    "title":         "Electoral AI Dashboard",
-    "home":          "Home",
-    "features":      "Features",
-    "contact":       "Contact",
-    "core_features": "Core Features",
-    "card1_title":   "Real-time Analysis",
-    "card1_desc":    "Monitor electoral data and analytics in real-time with high accuracy models.",
-    "card2_title":   "Accessible Reporting",
-    "card2_desc":    "Generate WCAG 2.1 AA compliant reports ensuring everyone has access to vital data.",
-    "learn_more":    "Learn More",
-    "voice_guide":   "Voice Guide",
-    "ask_ai":        "Ask the AI:",
-    "listening":     "Listening...",
-    "booth_title":   "Practice Voting Booth",
-    "booth_desc":    "Practice how to vote using the electronic ballot unit below.",
-    "candidate":     "Candidate",
-    "candidate_a":   "Candidate A",
-    "candidate_b":   "Candidate B",
-    "candidate_c":   "Candidate C",
-    "candidate_d":   "Candidate D",
-    "vote_btn":      "VOTE",
-    "confirm_title": "Confirm Your Vote",
-    "confirm_desc":  "Are you sure you want to vote for this candidate?",
-    "cancel":        "Cancel",
-    "confirm":       "Confirm",
-    "thank_you":     "Thank You for Practicing!",
-    "thank_you_desc":"Your vote has been simulated. This was just a practice session to help you understand the process.",
-    "back_to_booth": "Try Again",
-    "quiz_title":    "Voter Readiness Quiz",
-    "q1":            "Are you registered to vote?",
-    "q2":            "Do you have your Voter ID card?",
-    "q3":            "Do you know where your polling station is?",
-    "yes":           "YES",
-    "no":            "NO",
-    "quiz_success":  "You are fully ready to vote! Great job!",
-    "quiz_warning":  "You have a few things to sort out before voting day. Ask our AI for help!",
-    "timeline_title":"Election Timeline",
-    "phase_1":       "Nomination Phase",
-    "phase_2":       "Campaigning Phase",
-    "phase_3":       "Polling Day",
-    "phase_4":       "Counting Day",
-    "translating":   "Translating Interface..."
-}
-
-# ─── In-Memory Translation Cache ──────────────────────────────────────────────
-# Pre-populated with English to avoid any API call for the default language.
-# All other languages are loaded from the pre-generated static JSON file below.
-DICTIONARY_CACHE: dict = {
-    "en": BASE_DICTIONARY
-}
-
-# Load pre-generated translations from disk at startup.
-# This file is created by running: python generate_translations.py
-# After loading, all 10 languages are served from memory — zero API cost.
-TRANSLATIONS_FILE = os.path.join("static", "translations.json")
-if os.path.exists(TRANSLATIONS_FILE):
-    with open(TRANSLATIONS_FILE, "r", encoding="utf-8") as f:
-        DICTIONARY_CACHE.update(json.load(f))
-
-
-# ─── Helper: Gemini Model Factory ─────────────────────────────────────────────
-
-def get_clients(target_language: str = "en"):
     """
-    Returns initialized API clients and a language-specific Gemini model instance.
+    Request body schema for POST /api/ask.
 
-    For performance, Gemini models are cached per language code. The first call
-    for a given language creates and caches the model; subsequent calls return
-    the cached instance immediately.
-
-    Args:
-        target_language (str): BCP-47 language code for the desired AI response
-                               language. Defaults to "en" (English).
-
-    Returns:
-        tuple: (translate_client, tts_client, gemini_model)
-               Returns (None, None, None) in mock_mode.
+    Attributes:
+        question (str): The voter's natural-language question in any supported language.
+        target_language (str): ISO 639-1 language code for the AI response.
+                               Defaults to "en" (English).
     """
-    if settings.mock_mode:
-        return None, None, None
 
-    # Return cached model if it already exists for this language
-    if target_language in GEMINI_MODEL_CACHE:
-        return TRANSLATE_CLIENT, TTS_CLIENT, GEMINI_MODEL_CACHE[target_language]
-
-    # Map ISO 639-1 language codes to full language names for the system prompt
-    lang_map = {
-        "en": "English", "hi": "Hindi",  "ta": "Tamil",
-        "te": "Telugu",  "bn": "Bengali", "mr": "Marathi",
-        "gu": "Gujarati","kn": "Kannada", "ml": "Malayalam",
-        "pa": "Punjabi"
-    }
-    lang_name = lang_map.get(target_language, "English")
-
-    # System instruction enforces political neutrality and Indian electoral context.
-    # The language directive ensures the model responds in the user's chosen language.
-    system_instruction = (
-        f"You are a politically neutral Electoral AI assistant for the Election Commission of India. "
-        f"Your sole purpose is to provide factual, procedural information regarding Indian elections, "
-        f"voting mechanics, voter registration (like Form 6, EPIC, NVSP), and schedules. "
-        f"Do not express political opinions, biases, or comment on specific candidates or political events. "
-        f"YOU MUST RESPOND STRICTLY IN {lang_name.upper()}."
-    )
-
-    # Safety filters: block medium and above for all harm categories
-    safety_settings = {
-        HarmCategory.HARM_CATEGORY_HARASSMENT:        HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH:       HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-    }
-
-    # Create a new GenerativeModel instance with the language-specific system prompt
-    model = GenerativeModel(
-        "gemini-2.5-flash",
-        safety_settings=safety_settings,
-        system_instruction=[system_instruction]
-    )
-
-    # Cache the model for future requests in this language
-    GEMINI_MODEL_CACHE[target_language] = model
-    return TRANSLATE_CLIENT, TTS_CLIENT, model
+    question: str
+    target_language: str = "en"
 
 
 # ─── API Endpoints ────────────────────────────────────────────────────────────
 
-@router.get("/health", summary="Health Check")
-async def health_check():
+@router.get("/health", summary="Health Check", tags=["Infrastructure"])
+async def health_check() -> Dict[str, object]:
     """
     Returns the operational status of the backend service.
-    Used by Cloud Run and monitoring tools to verify the container is healthy.
+
+    Used by Google Cloud Run for liveness probes and by monitoring tools to
+    verify the container is alive and correctly configured. Also exposes the
+    ``mock_mode`` flag so clients can detect the running environment.
+
+    Returns:
+        Dict[str, object]: A dict with keys:
+            - ``status`` (str): Always "ok" if the service is running.
+            - ``mock_mode`` (bool): True if the service is in mock/test mode.
     """
     return {"status": "ok", "mock_mode": settings.mock_mode}
 
 
-@router.get("/dictionary", summary="Get UI Translation Dictionary")
-async def get_dictionary(lang: str = "en"):
+@router.get("/dictionary", summary="Get UI Translation Dictionary", tags=["Localization"])
+async def get_dictionary(lang: str = "en") -> Dict[str, str]:
     """
     Returns the complete UI translation dictionary for the requested language.
 
-    Translations are served entirely from the pre-generated `translations.json`
-    file loaded into memory at startup — making this endpoint near-instant and
-    completely free at runtime (no Google Translation API calls are made).
+    All translations are loaded from ``static/translations.json`` into memory
+    at startup (via ``load_dictionary_cache()``). This makes language switching
+    instant and completely free — no Translation API calls are made at runtime.
 
     Args:
         lang (str): ISO 639-1 language code (e.g., "hi", "ta", "en").
+                    Defaults to "en". Unknown codes fall back to English.
 
     Returns:
-        dict: Key-value pairs of UI string keys to their translated values.
-              Falls back to English if the requested language is not available.
+        Dict[str, str]: Key-value mapping of UI string keys to translated values.
+                        Falls back to the English BASE_DICTIONARY for unknown codes.
     """
     if lang in DICTIONARY_CACHE:
         return DICTIONARY_CACHE[lang]
 
-    # Graceful fallback: return English if language is not in the pre-generated cache
+    # Graceful fallback for any unknown or unsupported language code
     return DICTIONARY_CACHE.get("en", BASE_DICTIONARY)
 
 
-@router.post("/translate", summary="Translate Text")
-async def translate_text(req: TranslateRequest):
+@router.post("/translate", summary="Translate Text", tags=["Localization"])
+async def translate_text(req: TranslateRequest) -> Dict[str, str]:
     """
-    Translates a given text string into the specified target language.
+    Translates a text string into the specified target language.
 
-    Primarily used for translating voice navigation confirmation messages
-    (e.g., "Moving to the Election Timeline now") into the user's language
-    before passing them to the TTS engine.
+    Primarily used by the frontend's Voice-to-Action system to translate
+    English confirmation messages (e.g., "Moving to the Election Timeline now.")
+    into the user's selected language before passing them to the TTS endpoint.
+
+    In mock mode, returns a ``[LANG] <text>`` prefixed mock string without
+    making any API call.
 
     Args:
-        req (TranslateRequest): Contains `text` and `target_language`.
+        req (TranslateRequest): Request body containing:
+            - ``text`` (str): The source text to translate.
+            - ``target_language`` (str): ISO 639-1 target language code.
 
     Returns:
-        dict: {"translated_text": str}
+        Dict[str, str]: ``{"translated_text": "<translated string>"}``
 
     Raises:
-        HTTPException 500: If the Google Translation API call fails.
+        HTTPException (500): If the Google Translation API call fails.
     """
-    if settings.mock_mode:
-        return {"translated_text": f"[{req.target_language.upper()}] {req.text}"}
-
     try:
-        translate_client, _, _ = get_clients()
-        result = translate_client.translate(req.text, target_language=req.target_language)
-        return {"translated_text": result["translatedText"]}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        translated: str = translate_text_to_language(
+            text=req.text,
+            target_language=req.target_language,
+            translate_client=TRANSLATE_CLIENT,
+        )
+        return {"translated_text": translated}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
-@router.post("/tts", summary="Text to Speech")
-async def text_to_speech(req: TTSRequest):
+@router.post("/tts", summary="Text to Speech", tags=["Voice"])
+async def text_to_speech(req: TTSRequest) -> Dict[str, str]:
     """
-    Converts a text string into spoken audio using Google Cloud Text-to-Speech.
+    Converts a text string to spoken audio using Google Cloud Text-to-Speech.
 
-    The audio is returned as a Base64-encoded MP3 string, which the frontend
-    plays directly via the Web Audio API without any file storage.
+    The audio is returned as a Base64-encoded MP3 string. The frontend decodes
+    this and plays it directly via the Web Audio API — no file storage required.
 
-    Language codes are mapped to BCP-47 locale codes required by the TTS API
-    (e.g., "hi" → "hi-IN", "ta" → "ta-IN").
+    Language codes are mapped to BCP-47 locale codes by the TTS service layer.
+    Unknown language codes fall back gracefully to the ``en-US`` voice.
+
+    In mock mode, returns a static silent MP3 in Base64 without any API call.
 
     Args:
-        req (TTSRequest): Contains `text` (string to speak) and `language` (ISO code).
+        req (TTSRequest): Request body containing:
+            - ``text`` (str): The text to convert to speech.
+            - ``language`` (str): ISO 639-1 language code for voice selection.
 
     Returns:
-        dict: {"audio_base64": str} — Base64-encoded MP3 audio content.
+        Dict[str, str]: ``{"audio_base64": "<base64 MP3 string>"}``
 
     Raises:
-        HTTPException 500: If the Google TTS API call fails.
+        HTTPException (500): If the Google TTS API call fails.
     """
-    if settings.mock_mode:
-        # Return a minimal valid silent MP3 in Base64 for testing
-        return {"audio_base64": "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU5LjE2LjEwMAAAAAAAAAAAAAAA//tQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWgAAAAA=="}
-
     try:
-        _, tts_client, _ = get_clients()
-
-        # Map ISO 639-1 codes to BCP-47 locale codes for TTS voice selection
-        tts_lang_map = {
-            "en": "en-US", "hi": "hi-IN", "ta": "ta-IN", "te": "te-IN",
-            "bn": "bn-IN", "mr": "mr-IN", "gu": "gu-IN", "kn": "kn-IN",
-            "ml": "ml-IN", "pa": "pa-IN"
-        }
-        bcp47 = tts_lang_map.get(req.language, "en-US")
-
-        # Build the TTS synthesis request
-        synthesis_input = texttospeech.SynthesisInput(text=req.text)
-        voice = texttospeech.VoiceSelectionParams(
-            language_code=bcp47,
-            ssml_gender=texttospeech.SsmlVoiceGender.NEUTRAL  # Gender-neutral voice
+        audio_b64: str = synthesize_speech(
+            text=req.text,
+            language_code=req.language,
+            tts_client=TTS_CLIENT,
         )
-        audio_config = texttospeech.AudioConfig(
-            audio_encoding=texttospeech.AudioEncoding.MP3  # MP3 for broad browser compatibility
-        )
-
-        response = tts_client.synthesize_speech(
-            input=synthesis_input, voice=voice, audio_config=audio_config
-        )
-
-        # Encode the raw audio bytes to Base64 for JSON transport
-        audio_b64 = base64.b64encode(response.audio_content).decode("utf-8")
         return {"audio_base64": audio_b64}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-
-@router.post("/ask", summary="Ask the Electoral AI")
-async def ask_gemini(req: AskRequest):
+@router.post("/ask", summary="Ask the Electoral AI", tags=["AI"])
+async def ask_gemini(req: AskRequest) -> Dict[str, str]:
     """
-    Sends a voter's question to Gemini 2.5 Flash via Vertex AI and returns the answer.
+    Submits a voter's question to Gemini 2.5 Flash and returns the AI answer.
 
-    The Gemini model is pre-configured with a system instruction that:
-      - Locks responses to Indian electoral topics only (ECI, NVSP, Form 6, EPIC, etc.)
-      - Enforces strict political neutrality
-      - Forces the response to be in the user's selected language
+    The AI model is pre-configured to:
+      - Respond only about Indian electoral topics (ECI, NVSP, Form 6, EPIC, etc.)
+      - Maintain strict political neutrality at all times
+      - Respond in the user's selected language (enforced by the system prompt)
 
-    Retry Logic:
-        On a 429 (quota exceeded) error, the handler will wait 5 seconds and
-        retry up to 3 times before propagating the error to the client.
+    On transient 429 quota errors, the service retries up to 3 times with a
+    5-second delay between attempts (handled by ``ask_ai_with_retry``).
+
+    In mock mode, returns a static mock answer without any Vertex AI API call.
 
     Args:
-        req (AskRequest): Contains the `question` (user query) and
-                          `target_language` (ISO code for the response language).
+        req (AskRequest): Request body containing:
+            - ``question`` (str): The voter's natural-language question.
+            - ``target_language`` (str): ISO 639-1 code for the AI response language.
+                                        Defaults to "en".
 
     Returns:
-        dict: {"answer": str} — The AI-generated response text.
+        Dict[str, str]: ``{"answer": "<AI-generated response>"}``
 
     Raises:
-        HTTPException 500: If all retry attempts fail or another error occurs.
+        HTTPException (500): If the Gemini API fails after all retry attempts.
     """
-    if settings.mock_mode:
-        mock_response = "This is a mock answer about the election. Mock Mode is currently ON."
-        if req.target_language != "en":
-            mock_response = f"[{req.target_language.upper()}] {mock_response}"
-        return {"answer": mock_response}
-
     try:
-        _, _, gemini_model = get_clients(req.target_language)
-        prompt = f"Answer the following question accurately and concisely: {req.question}"
-
-        # Retry loop: handles transient 429 quota errors from Vertex AI
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = gemini_model.generate_content(prompt)
-                return {"answer": response.text}
-            except Exception as e:
-                error_str = str(e)
-                is_quota_error = "429" in error_str
-                is_last_attempt = attempt >= max_retries - 1
-
-                if is_quota_error and not is_last_attempt:
-                    # Wait before retrying to allow quota to reset
-                    time.sleep(5)
-                    continue
-                else:
-                    raise HTTPException(status_code=500, detail=error_str)
-
-    except HTTPException:
-        raise  # Re-raise HTTPExceptions without wrapping them again
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        answer: str = ask_ai_with_retry(
+            question=req.question,
+            language_code=req.target_language,
+        )
+        return {"answer": answer}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
