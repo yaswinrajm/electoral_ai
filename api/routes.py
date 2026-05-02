@@ -58,12 +58,18 @@ def init_clients():
     this at module level rather than inside request handlers, we avoid the
     latency cost of client initialization on every API call.
 
+    MOCK_MODE is read directly from os.environ at call time (not from the
+    pre-loaded settings object) so that pytest-env can override it before
+    the module is imported during test collection.
+
     In mock_mode, this function is a no-op — no real API credentials are needed.
     """
     global TRANSLATE_CLIENT, TTS_CLIENT
 
-    if settings.mock_mode:
-        return  # Skip initialization in mock/dev mode
+    # Read directly from os.environ so pytest-env override takes effect
+    mock_mode = os.environ.get("MOCK_MODE", "false").lower() in ("true", "1", "yes")
+    if mock_mode:
+        return  # Skip all Google API initialization in mock/test mode
 
     # Initialize Translation client (singleton)
     if TRANSLATE_CLIENT is None:
