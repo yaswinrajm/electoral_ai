@@ -2,9 +2,31 @@ import os
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from config import settings
+import json
 import base64
+import vertexai
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
+from google.cloud import translate_v2 as translate
+from google.cloud import texttospeech
 
 router = APIRouter()
+
+# Global Client Cache
+TRANSLATE_CLIENT = None
+TTS_CLIENT = None
+GEMINI_MODEL_CACHE = {}
+
+def init_clients():
+    global TRANSLATE_CLIENT, TTS_CLIENT
+    if settings.mock_mode:
+        return
+    if TRANSLATE_CLIENT is None:
+        TRANSLATE_CLIENT = translate.Client()
+    if TTS_CLIENT is None:
+        TTS_CLIENT = texttospeech.TextToSpeechClient()
+    vertexai.init(project="daring-span-495114-b2", location="us-central1")
+
+init_clients()
 
 class TranslateRequest(BaseModel):
     text: str
@@ -70,31 +92,15 @@ DICTIONARY_CACHE = {
     "en": BASE_DICTIONARY
 }
 
-# Helper function to initialize clients safely
 def get_clients(target_language="en"):
     if settings.mock_mode:
         return None, None, None
         
-    # Only import if not in mock mode to prevent crash if credentials missing
-    from google.cloud import translate_v2 as translate
-    from google.cloud import texttospeech
-    import vertexai
-    from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
-
-    if settings.google_application_credentials:
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(settings.google_application_credentials)
+    global GEMINI_MODEL_CACHE
     
-    translate_client = translate.Client()
-    tts_client = texttospeech.TextToSpeechClient()
-    
-    vertexai.init(project="daring-span-495114-b2", location="us-central1")
-    
-    safety_settings = {
-        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-    }
+    # Check if model for this language is already in cache
+    if target_language in GEMINI_MODEL_CACHE:
+        return TRANSLATE_CLIENT, TTS_CLIENT, GEMINI_MODEL_CACHE[target_language]
 
     # Dynamic system instruction based on language
     lang_map = {
@@ -106,47 +112,40 @@ def get_clients(target_language="en"):
 
     system_instruction = f"You are a politically neutral Electoral AI assistant for the Election Commission of India. Your sole purpose is to provide factual, procedural information regarding Indian elections, voting mechanics, voter registration (like Form 6, EPIC, NVSP), and schedules. Do not express political opinions, biases, or comment on specific candidates or political events. YOU MUST RESPOND STRICTLY IN {lang_name.upper()}."
     
-    gemini_model = GenerativeModel(
+    safety_settings = {
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    }
+
+    model = GenerativeModel(
         "gemini-2.5-flash",
         safety_settings=safety_settings,
         system_instruction=[system_instruction]
     )
     
-    return translate_client, tts_client, gemini_model
+    GEMINI_MODEL_CACHE[target_language] = model
+    return TRANSLATE_CLIENT, TTS_CLIENT, model
 
 @router.get("/health")
 async def health_check():
     return {"status": "ok", "mock_mode": settings.mock_mode}
 
+# Load pre-generated translations at startup
+TRANSLATIONS_FILE = os.path.join("static", "translations.json")
+if os.path.exists(TRANSLATIONS_FILE):
+    with open(TRANSLATIONS_FILE, "r", encoding="utf-8") as f:
+        DICTIONARY_CACHE.update(json.load(f))
+
 @router.get("/dictionary")
 async def get_dictionary(lang: str = "en"):
-    """Returns the deep translated dictionary for the requested language."""
+    """Returns the deep translated dictionary for the requested language from local cache."""
     if lang in DICTIONARY_CACHE:
         return DICTIONARY_CACHE[lang]
         
-    if settings.mock_mode:
-        mock_dict = {k: f"[{lang.upper()}] {v}" for k, v in BASE_DICTIONARY.items()}
-        DICTIONARY_CACHE[lang] = mock_dict
-        return mock_dict
-
-    try:
-        translate_client, _, _ = get_clients(lang)
-        keys = list(BASE_DICTIONARY.keys())
-        values = list(BASE_DICTIONARY.values())
-        
-        # Google Translate API can take a list of strings
-        result = translate_client.translate(values, target_language=lang)
-        
-        translated_dict = {}
-        for idx, item in enumerate(result):
-            translated_dict[keys[idx]] = item["translatedText"]
-            
-        DICTIONARY_CACHE[lang] = translated_dict
-        return translated_dict
-    except Exception as e:
-        # Fallback to english on error
-        print(f"Translation Error: {e}")
-        return BASE_DICTIONARY
+    # Fallback to English if language not found in pre-generated cache
+    return DICTIONARY_CACHE.get("en", BASE_DICTIONARY)
 
 @router.post("/translate")
 async def translate_text(req: TranslateRequest):
